@@ -438,6 +438,7 @@ pub fn start_client(
     let mut stdout = os_input.get_stdout_writer();
     let _ = stdout.write(goodbye_message.as_bytes()).unwrap();
     stdout.flush().unwrap();
+    os_input.close().unwrap();
 }
 
 #[cfg(test)]

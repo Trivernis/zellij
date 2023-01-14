@@ -15,6 +15,7 @@ url = { version = "2.2.2", features = ["serde"] }
 serde_yaml = "0.8"
 zellij-utils = { path = "../zellij-utils/", version = "0.34.5" }
 log = "0.4.17"
+rand = "0.8.0"
 
 [dev-dependencies]
 insta = "1.6.0"

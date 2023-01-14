@@ -1,3 +1,4 @@
+use rand::Rng;
 use zellij_utils::anyhow::{Context, Result};
 use zellij_utils::pane_size::Size;
 use zellij_utils::{interprocess, libc, nix, signal_hook};
@@ -7,11 +8,13 @@ use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use nix::pty::Winsize;
 use nix::sys::termios;
 use signal_hook::{consts::signal::*, iterator::Signals};
-use std::io::prelude::*;
+use std::fs::{self, File, OpenOptions};
+use std::io::{prelude::*, stdout, BufReader, BufWriter};
 use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::{io, thread, time};
+use std::time::Duration;
+use std::{io, process, thread, time};
 use zellij_utils::{
     data::Palette,
     errors::ErrorContext,
@@ -78,6 +81,7 @@ pub struct ClientOsInputOutput {
     orig_termios: Option<Arc<Mutex<termios::Termios>>>,
     send_instructions_to_server: Arc<Mutex<Option<IpcSenderWithContext<ClientToServerMsg>>>>,
     receive_instructions_from_server: Arc<Mutex<Option<IpcReceiverWithContext<ServerToClientMsg>>>>,
+    writer: DiskBackedStdout,
 }
 
 /// The `ClientOsApi` trait represents an abstract interface to the features of an operating system that
@@ -111,6 +115,7 @@ pub trait ClientOsApi: Send + Sync {
     fn disable_mouse(&self) -> Result<()>;
     // Repeatedly send action, until stdin is readable again
     fn stdin_poller(&self) -> StdinPoller;
+    fn close(&self) -> Result<()>;
 }
 
 impl ClientOsApi for ClientOsInputOutput {
@@ -145,8 +150,7 @@ impl ClientOsApi for ClientOsInputOutput {
         read_bytes
     }
     fn get_stdout_writer(&self) -> Box<dyn io::Write> {
-        let stdout = ::std::io::stdout();
-        Box::new(stdout)
+        Box::new(self.writer.clone())
     }
     fn get_stdin_reader(&self) -> Box<dyn io::Read> {
         let stdin = ::std::io::stdin();
@@ -247,6 +251,12 @@ impl ClientOsApi for ClientOsInputOutput {
     fn stdin_poller(&self) -> StdinPoller {
         StdinPoller::default()
     }
+
+    fn close(&self) -> Result<()> {
+        self.writer.close()?;
+
+        Ok(())
+    }
 }
 
 impl Clone for Box<dyn ClientOsApi> {
@@ -258,10 +268,12 @@ impl Clone for Box<dyn ClientOsApi> {
 pub fn get_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
     let current_termios = termios::tcgetattr(0)?;
     let orig_termios = Some(Arc::new(Mutex::new(current_termios)));
+
     Ok(ClientOsInputOutput {
         orig_termios,
         send_instructions_to_server: Arc::new(Mutex::new(None)),
         receive_instructions_from_server: Arc::new(Mutex::new(None)),
+        writer: DiskBackedStdout::create().unwrap(),
     })
 }
 
@@ -271,6 +283,7 @@ pub fn get_cli_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
         orig_termios,
         send_instructions_to_server: Arc::new(Mutex::new(None)),
         receive_instructions_from_server: Arc::new(Mutex::new(None)),
+        writer: DiskBackedStdout::create().unwrap(),
     })
 }
 
@@ -315,4 +328,90 @@ impl Default for StdinPoller {
             timeout,
         }
     }
+}
+
+const BUF_SIZE: usize = 1024;
+
+#[derive(Clone)]
+pub struct DiskBackedStdout {
+    writer: Arc<Mutex<BufWriter<File>>>,
+    key: u8,
+    path: PathBuf,
+}
+
+impl DiskBackedStdout {
+    pub fn create() -> io::Result<Self> {
+        let path = PathBuf::from(format!("/tmp/zellij-{}", process::id()));
+
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        File::create(&path)?;
+        DiskBackedStdout::open(&path)
+    }
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let key = random_u8();
+        DiskBackedStdout::create_read_half(path, key)?;
+        let writer = DiskBackedStdout::create_write_half(path)?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            key,
+            writer: Arc::new(Mutex::new(writer)),
+        })
+    }
+
+    fn create_read_half(path: &Path, key: u8) -> io::Result<()> {
+        let reader = OpenOptions::new().read(true).open(path)?;
+        let mut reader = BufReader::new(reader);
+
+        thread::spawn(move || loop {
+            let mut buf = [0u8; BUF_SIZE];
+
+            let size = reader
+                .read(&mut buf)
+                .expect("Failed to read from disk buffer");
+            if size > 0 {
+                let buf = buf.iter().map(|k| k ^ key).take(size).collect::<Vec<_>>();
+                stdout().write(&buf).expect("Failed to write to stdout");
+                stdout().flush().expect("Failed to flush stdout");
+
+                if size == 1 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        Ok(())
+    }
+
+    fn create_write_half(path: &Path) -> io::Result<BufWriter<File>> {
+        let file = OpenOptions::new().write(true).open(path)?;
+        Ok(BufWriter::new(file))
+    }
+
+    fn close(&self) -> io::Result<()> {
+        if self.path.exists() {
+            fs::remove_file(&self.path)?;
+        }
+        Ok(())
+    }
+}
+
+impl io::Write for DiskBackedStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let buf = buf.iter().map(|k| k ^ self.key).collect::<Vec<_>>();
+        self.writer.lock().unwrap().write(buf.as_slice())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.lock().unwrap().flush()
+    }
+}
+
+fn random_u8() -> u8 {
+    let mut rng = rand::thread_rng();
+    rng.gen()
 }
